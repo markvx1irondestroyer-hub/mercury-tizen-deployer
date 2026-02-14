@@ -1,67 +1,71 @@
 #!/bin/bash
-# 🧟 MERCURY: DUMMY-PROOF TIZEN DEPLOYER (v2.3)
-# 🛡️ Hardened for Security & Reliability
+# 🧟 MERCURY: DUMMY-PROOF TIZEN DEPLOYER (v3.0)
+# 🛠️ Hardened for Tizen 8.0+ and Network Integrity
 
-set -euo pipefail # Exit on error, unset vars, or pipe failure
+set -euo pipefail
 
-echo "🚀 Initializing Tizen Sideload Protocol..."
+echo "🚀 Initializing Tizen Sideload Protocol v3.0..."
 
-# 0. Environment & Permissions Check
-if ! command -v docker &> /dev/null; then
-    echo "❌ ERROR: Docker is not installed. Please install it first."
-    exit 1
-fi
+# 0. Dependency Check (Including 'nc' for port probing and 'jq' for API)
+for cmd in docker curl nc jq; do
+    if ! command -v "$cmd" &> /dev/null; then
+        echo "❌ ERROR: Required dependency '$cmd' is missing. Run: sudo apt install netcat-openbsd jq"
+        exit 1
+    fi
+done
 
-if ! docker info >/dev/null 2>&1; then
-    echo "❌ ERROR: Docker daemon is not running. Run: sudo systemctl start docker"
-    exit 1
-fi
-
-# 1. Target Identification with Regex Sanitization
+# 1. Target Identification & Octet Validation
 read -p "Enter Samsung TV IP: " TV_IP
-if [[ ! $TV_IP =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-    echo "❌ ERROR: Invalid IP format. Use IPv4 (e.g. 192.168.1.50)."
+if [[ ! $TV_IP =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "❌ ERROR: Invalid IP format."
     exit 1
 fi
 
-# 2. Connectivity Ping
-echo "📡 Pinging TV at $TV_IP..."
-if ! ping -c 1 -W 2 "$TV_IP" > /dev/null; then
-    echo "❌ ERROR: Cannot reach TV. Is Developer Mode ON and IP correct?"
+IFS='.' read -r -a octets <<< "$TV_IP"
+for octet in "${octets[@]}"; do
+    if ((octet < 0 || octet > 255)); then
+        echo "❌ ERROR: IP octet $octet is out of range (0-255)."
+        exit 1
+    fi
+done
+
+# 2. SDB Port Verification (Checks Developer Mode, not just power)
+echo "📡 Probing Tizen SDB Port (26101) at $TV_IP..."
+if ! nc -z -w 3 "$TV_IP" 26101; then
+    echo "❌ ERROR: Port 26101 closed. Is Developer Mode ON and your PC IP whitelisted on the TV?"
     exit 1
 fi
-echo "✅ TV is Online."
+echo "✅ TV Developer Bridge is Online."
 
-# 3. Safety Gate (Manual Verification)
-echo "--------------------------------------"
-read -p "❓ Is Jellyfin already installed on this TV? [y/n]: " PREV_INSTALLED
-if [[ "$PREV_INSTALLED" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-    echo "🧟 ZOMBIE UPDATE PROTOCOL INITIATED..."
-    echo "1. On TV: Highlight Jellyfin > Hold 'Enter' > Select 'Delete'."
-    read -p "✅ Is the TV clear and ready? [y/n]: " READY
-    [[ "${READY,,}" != "y" ]] && { echo "Aborting for safety."; exit 1; }
-fi
-
-# 4. API-Based Version Scouting (No scraping)
-echo "🔍 Scouting latest release via GitHub API..."
-LATEST_TAG=$(curl -s https://api.github.com/repos/jeppevinkel/jellyfin-tizen-builds/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+# 3. API-Based Version Scouting (Hardened against Rate Limits)
+echo "🔍 Fetching latest release..."
+LATEST_TAG=$(curl -s https://api.github.com/repos/jeppevinkel/jellyfin-tizen-builds/releases/latest | jq -r '.tag_name // empty')
 
 if [ -z "$LATEST_TAG" ]; then
-    echo "⚠️ Warning: Could not fetch tag. Defaulting to stable 10.8.z."
+    echo "⚠️ Warning: Could not fetch tag (Rate limited?). Defaulting to stable 10.8.z."
     JELLY_VER="release-10.8.z"
 else
-    echo "--------------------------------------"
-    echo "Select Deployment Type:"
-    echo "1) [STABLE]   - v10.8.z (For Legacy TVs)"
-    echo "2) [LATEST]   - $LATEST_TAG (Modern TVs 2020+)"
-    read -p "Choice [1 or 2]: " MODE
-    [[ "${MODE:-1}" == "2" ]] && JELLY_VER="$LATEST_TAG" || JELLY_VER="release-10.8.z"
+    JELLY_VER="$LATEST_TAG"
+fi
+
+# 4. Tizen 8.0+ Certificate Handling
+CERT_ARGS=""
+CERT_PASS=""
+if [ -f "author.p12" ] && [ -f "distributor.p12" ]; then
+    echo "🔐 Custom Tizen certificates detected."
+    read -sp "Enter Certificate Password: " CERT_PASS
+    echo ""
+    # Mount local certificates into the container's expected path
+    CERT_ARGS="-v $(pwd)/author.p12:/certificates/author.p12 -v $(pwd)/distributor.p12:/certificates/distributor.p12"
+else
+    echo "⚠️ No local .p12 certificates found. Using generic signatures (May fail on 2024+ TVs)."
 fi
 
 # 5. Deployment Execution
 echo "🧟 Deploying $JELLY_VER to $TV_IP..."
-docker run --rm \
+# shellcheck disable=SC2086
+docker run --rm $CERT_ARGS \
   -e JELLYFIN_RELEASE="$JELLY_VER" \
-  ghcr.io/georift/install-jellyfin-tizen "$TV_IP"
+  ghcr.io/georift/install-jellyfin-tizen "$TV_IP" Jellyfin "" "$CERT_PASS"
 
 echo "✅ Protocol Complete. Check your TV Apps section."
